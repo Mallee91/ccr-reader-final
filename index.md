@@ -429,7 +429,28 @@ function safeParseJSON(s){
 
 // ---------- Gemini API ----------
 
-async function callGemini(system, messages, maxTokens){
+// Keep requests below the 15 RPM free-tier limit.
+// 5 seconds between requests = a maximum of about 12 requests/minute.
+const GEMINI_REQUEST_DELAY = 5000;
+
+let lastGeminiRequestTime = 0;
+
+async function waitForGeminiSlot(){
+  const now = Date.now();
+  const elapsed = now - lastGeminiRequestTime;
+
+  if(elapsed < GEMINI_REQUEST_DELAY){
+    await new Promise(r =>
+      setTimeout(r, GEMINI_REQUEST_DELAY - elapsed)
+    );
+  }
+
+  lastGeminiRequestTime = Date.now();
+}
+
+async function callGemini(system, messages, maxTokens, attempt){
+
+  attempt = attempt || 1;
 
   const contents = messages.map(m => ({
     role: m.role === "assistant" ? "model" : "user",
@@ -437,7 +458,9 @@ async function callGemini(system, messages, maxTokens){
   }));
 
   const body = {
-    system_instruction: { parts: [{ text: system }] },
+    system_instruction: {
+      parts: [{ text: system }]
+    },
     contents: contents,
     generationConfig: {
       maxOutputTokens: maxTokens || 2000
@@ -449,19 +472,78 @@ async function callGemini(system, messages, maxTokens){
     encodeURIComponent(state.model) +
     ":generateContent";
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": state.apiKey
-    },
-    body: JSON.stringify(body)
-  });
+  // Wait before every actual Gemini request.
+  await waitForGeminiSlot();
+
+  let res;
+
+  try{
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": state.apiKey
+      },
+      body: JSON.stringify(body)
+    });
+  }catch(e){
+
+    // Network connection problem.
+    if(attempt < 3){
+      await new Promise(r => setTimeout(r, 5000));
+      return callGemini(system, messages, maxTokens, attempt + 1);
+    }
+
+    throw new Error(
+      "Could not connect to Gemini after 3 attempts: " + e.message
+    );
+  }
 
   if(!res.ok){
+
     const errText = await res.text();
+
+    // 429 = rate limit / quota temporarily exceeded.
+    if(res.status === 429 && attempt < 4){
+
+      const retryDelay =
+        Math.min(30000, 10000 * attempt);
+
+      await new Promise(r => setTimeout(r, retryDelay));
+
+      return callGemini(
+        system,
+        messages,
+        maxTokens,
+        attempt + 1
+      );
+    }
+
+    // Temporary Google server problems.
+    if(
+      (res.status === 500 ||
+       res.status === 502 ||
+       res.status === 503 ||
+       res.status === 504) &&
+      attempt < 3
+    ){
+
+      await new Promise(r => setTimeout(r, 5000 * attempt));
+
+      return callGemini(
+        system,
+        messages,
+        maxTokens,
+        attempt + 1
+      );
+    }
+
+    // Permanent or otherwise unhandled error.
     throw new Error(
-      "API error " + res.status + ": " + errText.slice(0,300)
+      "Gemini API error " +
+      res.status +
+      ": " +
+      errText.slice(0,500)
     );
   }
 
@@ -470,20 +552,30 @@ async function callGemini(system, messages, maxTokens){
   const candidate = (data.candidates || [])[0];
 
   if(!candidate){
+
     const blockReason =
-      data.promptFeedback && data.promptFeedback.blockReason;
+      data.promptFeedback &&
+      data.promptFeedback.blockReason;
 
     throw new Error(
       blockReason
         ? "Blocked by Google's safety filter: " + blockReason
-        : "No response returned"
+        : "Gemini returned no response"
     );
   }
 
   const parts =
-    (candidate.content && candidate.content.parts) || [];
+    (candidate.content &&
+     candidate.content.parts) || [];
 
-  return parts.map(p => p.text || "").join("\n");
+  const output =
+    parts.map(p => p.text || "").join("\n");
+
+  if(!output.trim()){
+    throw new Error("Gemini returned an empty response");
+  }
+
+  return output;
 }
 
 // ---------- PDF / text extraction ----------
